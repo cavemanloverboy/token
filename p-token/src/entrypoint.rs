@@ -7,10 +7,82 @@ use {
         pubkey::Pubkey,
         ProgramResult,
     },
-    pinocchio_token_interface::error::TokenError,
+    pinocchio_token_interface::{error::TokenError, likely, unlikely_branch},
 };
 
-program_entrypoint!(process_instruction);
+#[doc = r" Program entrypoint."]
+#[no_mangle]
+pub unsafe extern "C" fn entrypoint(input: *mut u8) -> u64 {
+    const ACCOUNT1_HEADER: usize = 0x0008;
+    const ACCOUNT1_DATA_LEN: usize = 0x0058;
+    const ACCOUNT2_HEADER: usize = 0x2910;
+    const ACCOUNT2_DATA_LEN: usize = 0x2960;
+    const ACCOUNT3_HEADER: usize = 0x5218;
+    const ACCOUNT3_DATA_LEN: usize = 0x5268;
+    const INSTRUCTION_DATA_LEN: usize = 0x7a78;
+
+    #[inline]
+    fn round_to_next_8(input: u64) -> u64 {
+        (input + 7) & (!7)
+    }
+
+    // fast path
+    if likely(
+        // there are 3 accounts (source, dest, auth)
+        *input == 3
+        // first two accounts have correct token account data length, and 2 and 3 are not dups
+        && (*input.add(ACCOUNT1_DATA_LEN).cast::<u64>() == 165)
+        && (*input.add(ACCOUNT2_HEADER) == 255)
+        && (*input.add(ACCOUNT2_DATA_LEN).cast::<u64>() == 165)
+        && (*input.add(ACCOUNT3_HEADER) == 255),
+    ) {
+        // get account 3 data len and round up to next value of 8
+        let account_3_data_len_rounded_up =
+            round_to_next_8(*input.add(ACCOUNT3_DATA_LEN).cast::<u64>()) as usize;
+        let real_ix_data_len_offset = INSTRUCTION_DATA_LEN + account_3_data_len_rounded_up;
+
+        // now check ix data len
+        if likely(input.add(real_ix_data_len_offset).cast::<u64>().read() >= 9) {
+            // check for transfer discriminator
+            // and if correct read transfer amount
+            let disc = input.add(real_ix_data_len_offset + 8).cast::<u8>().read();
+            if likely(disc == 3) {
+                let accounts = unsafe {
+                    [
+                        core::mem::transmute::<*mut u8, AccountInfo>(input.add(ACCOUNT1_HEADER)),
+                        core::mem::transmute::<*mut u8, AccountInfo>(input.add(ACCOUNT2_HEADER)),
+                        core::mem::transmute::<*mut u8, AccountInfo>(input.add(ACCOUNT3_HEADER)),
+                    ]
+                };
+                // we are ok to truncate here. ix only checks that there are at least enough bytes for a u64
+                let instruction_data = unsafe {
+                    core::slice::from_raw_parts(input.add(real_ix_data_len_offset + 9), 8)
+                };
+                if let Err(e) = process_transfer(&accounts, instruction_data) {
+                    unlikely_branch();
+                    return e.into();
+                }
+                return 0;
+            }
+        }
+    } else {
+        // maybe batch transfer
+    }
+
+    const UNINIT: core::mem::MaybeUninit<pinocchio::account_info::AccountInfo> =
+        core::mem::MaybeUninit::<pinocchio::account_info::AccountInfo>::uninit();
+    let mut accounts = [UNINIT; { pinocchio::MAX_TX_ACCOUNTS }];
+    let (program_id, count, instruction_data) =
+        pinocchio::entrypoint::deserialize::<{ pinocchio::MAX_TX_ACCOUNTS }>(input, &mut accounts);
+    match process_instruction(
+        &program_id,
+        core::slice::from_raw_parts(accounts.as_ptr() as _, count),
+        &instruction_data,
+    ) {
+        Ok(()) => pinocchio::SUCCESS,
+        Err(error) => error.into(),
+    }
+}
 // Do not allocate memory.
 no_allocator!();
 // Use the no_std panic handler.
